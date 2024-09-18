@@ -80,6 +80,7 @@
         Remove-Item $ExportResults -Force -ErrorAction SilentlyContinue
         Remove-Item "$Root\MediaFolder" -Recurse -Force -ErrorAction SilentlyContinue
       }
+    $ThrottleLimit = 6
 
     Function CatchString {
       [CmdLetBinding()]
@@ -176,8 +177,13 @@
           }
         $TotalLinkCount = $ResultCount  
       }
-    Write-Host "Scraping $TotalLinkCount house(s) :`r`n"
-    $ItemCounter = 0
+    Write-Host "Total $TotalLinkCount house(s) :`r`n"
+
+
+    $CatchString=${Function:CatchString}.ToString()
+    $TotalPages=${Function:TotalPages}.ToString()
+    $RequestPage=${Function:RequestPage}.ToString()
+
   }
 
   Process {
@@ -197,14 +203,27 @@
       } Else {
         $Sites = @()
       }
-    For ( $I = 1; $I -Le $TotalPageCount; $I++ ) {
-      $Uri = "$FundaSearchLink&search_result=$I"
-      $Invoke = RequestPage $Uri
-      $Links = $Invoke.Links.href | Where { $PSItem -Match '/detail/' } | Select -Unique
-        ForEach ( $Page in $Links ) {
-          $ItemCounter++
-            If ( $Sites.Page -NotContains $Page ) {
-              $Content = ( RequestPage $Page ).Content
+
+      $Pages=1..$TotalPageCount|% -ThrottleLimit $ThrottleLimit -Parallel {
+        ${Function:RequestPage} = $Using:RequestPage
+        $Uri = "$Using:FundaSearchLink&search_result=$_"
+        $Invoke = RequestPage $Uri
+        $Invoke.Links.href | Where { $PSItem -Match '/detail/' } | Select -Unique
+      }
+
+      If ( $ResultCount ) { $Pages = $Pages | Select -First $ResultCount }
+
+        $Result=$Pages|% -ThrottleLimit $ThrottleLimit -Parallel {
+
+          $IndexNumber = ( $Using:Pages ).IndexOf( $_ )+1
+          
+          ${Function:CatchString} = $Using:CatchString
+          ${Function:TotalPages} = $Using:TotalPages
+          ${Function:RequestPage} = $Using:RequestPage
+          $NewBroker = $False
+
+            If ( $Sites.Page -NotContains $_ ) {
+              $Content = Try { ( RequestPage $_ ).Content } Catch { Write-Host "ERROR" }
               $StraatHuisnummer = ( ( CatchString 'isinternational="' '</span><span' $Content ) -Split '>' )[-1]
               $Plaats = CatchString '"addressLocality":"' '"' $Content
               $StartString = 'ext-4xl">' + $StraatHuisnummer + '</span><span class="text-neutral-40">'
@@ -239,23 +258,19 @@
               $Beschrijving = CatchString '<meta name="description" content="' '">' $Content
               $Internationaal = CatchString 'isinternational="' '"' $Content; If ( $Internationaal -Eq 'false' ) { $Internationaal = "Nee" } Else { $Internationaal = "Ja" }
               $MakelaarId = ( ( CatchString '"listing_place"' '","/detail/koop/' $Content ).Split( '},' )[-1] ).Split(',"')[0]
-                ( $BrokerInfo ).ForEach{
+                ( $Using:BrokerInfo ).ForEach{
                   If ( $PSItem.MakelaarId -Eq $MakelaarId ) {
                     $Makelaar = $PSItem.Makelaar
                     $MakelaarWebsite = $PSItem.MakelaarWebsite
                   }
                 }
                 If ( !$Makelaar ) {
+                  $NewBroker = $True
                   $MakelaarRequest = ( RequestPage "https://funda.nl/makelaar/$MakelaarId" )
                   $Makelaar = ( ( CatchString '<title>' '</title>' ( $MakelaarRequest ).Content ).Replace(' [funda]' , '' ).Replace( '&amp;' , '&' ).Replace( '&#x27;' , "`'" ).Replace( '&#x2F;' , '-' ) ).Trim()
                   $MakelaarWebSite = ( ( $MakelaarRequest ).Links.href | Where { $PSItem -NotMatch 'funda' -And $PSItem -NotMatch 'facebook' -And $PSItem -NotMatch 'instagram' -And $PSItem -Match 'http' -And $PSItem -NotMatch 'nvm.nl' -And $PSItem -NotMatch 'x.com' -And $PSItem -NotMatch 'linkedin.com' -And $PSItem -NotMatch 'twitter' -And $PSItem -NotMatch 'wa.me' -And $PSItem -NotMatch 'vastgoedpro.nl' -And $PSItem -NotMatch 'vbomakelaar.nl' } | Select -Unique ) -Join ','
-                  #$MakelaarTelefoonnummer = CatchString 'tel:' '"' $MakelaarRequest
-                  #$MakelaarEmailadres = ( ( CatchString '{"email":' '","' $MakelaarRequest ) -Split '"' )[-1]
-                  #$MakelaarAdres = ( CatchString '<address class="not-italic">' '</address>' $MakelaarRequest ).Replace( ' <br> ' , ', ' )
-                  Write-Host "New broker found : $Makelaar"
-                  If ( Test-Path $ExportResults ) { $BrokerInfo = Import-Excel $ExportResults -WorksheetName "$ScriptBaseName" | Select MakelaarId,Makelaar,MakelaarWebsite }
                 }
-              Write-Host "$ItemCounter / $TotalLinkCount - Scraping : $Makelaar - $VolledigAdres"
+              Write-Host "$Makelaar - $VolledigAdres"
               $AangebodenSinds = CatchString '"Aangeboden sinds","' '",{' $Content
               $LaatsteVraagprijs = ""
               $Vraagprijs = ( ( ( CatchString 'Vraagprijs</dt>' '</span>' $Content ) -Split '>' )[-1] ).Replace( "`€ " , '' ).Replace( '.' , '' )
@@ -334,7 +349,7 @@
               $Omschrijving = ( ( ( CatchString '"Omschrijving","' '"' $Content ) -Split '>' )[-1] ).Replace( ' \n\n' , ' ' ).Replace( ' \n' , '. ' ).Replace( '\n' , ' ' )
               $DateTimeScraped = ( Get-Date ).ToString( "d MMMM yyyy HH:mm:ss",[CultureInfo]"nl-NL" )
               $Object = New-Object PSCustomObject
-              $Object | Add-Member 'Page' $Page
+              $Object | Add-Member 'Page' $_
               $Object | Add-Member 'VolledigAdres' $VolledigAdres
               $Object | Add-Member 'AangebodenSinds' $AangebodenSinds
               $Object | Add-Member 'Vraagprijs' $Vraagprijs
@@ -389,91 +404,66 @@
               $Object | Add-Member 'KadastraleGegevensLink' $KadastraleGegevensLink
               $Object | Add-Member 'MakelaarId' $MakelaarId
               $Object | Add-Member 'MakelaarWebsite' $MakelaarWebsite
-              #$Object | Add-Member 'MakelaarAdres' $MakelaarAdres
-              #$Object | Add-Member 'MakelaarTelefoonnummer' $MakelaarTelefoonnummer
-              #$Object | Add-Member 'MakelaarEmailadres' $MakelaarEmailadres
               $Object | Add-Member 'Beschrijving' $Beschrijving
               $Object | Add-Member 'Omschrijving' $Omschrijving
               $Object | Add-Member 'DateTimeScraped' $DateTimeScraped
-              $Object | Add-Member 'Print' ( $Page+'/print/' )
-              $TryCount = 0
-              $TryCountEnd = 20
-              $RetryInterval = 1500
-                Do {
-                  $Saved = $False
+              $Object | Add-Member 'Print' ( $_+'/print/' )
+                If ( $NewBroker ) {
                   Try {
-                    $Object | Export-Excel $ExportResults -WorksheetName "$ScriptBaseName" -Append -ErrorAction Stop
-                    $Saved = $True
+                    Write-Host "New Broker : $Makelaar"
+                    $Object | Export-Excel $Using:ExportResults -WorksheetName "$Using:ScriptBaseName" -Append -ErrorAction Stop
                   } Catch {
-                    $TryCount++
-                    Write-Host "Problem saving, retry $TryCount / $TryCountEnd"
-                    Start-Sleep -M $RetryInterval
+                    Start-Sleep 5
+                    $Object | Export-Excel $Using:ExportResults -WorksheetName "$Using:ScriptBaseName" -Append -ErrorAction Stop
                   }
-                } Until ( $Saved -Or $Count -Ge $TryCountEnd )
+                }
+              Return $Object
                 If ( $DownloadMedia ) {
-                  $MediaBaseFolder = "$Root\MediaFolder"; New-Item $MediaBaseFolder -ItemType Directory -ErrorAction SilentlyContinue | Out-Null
+                  $MediaBaseFolder = "$Using:Root\MediaFolder"; New-Item $MediaBaseFolder -ItemType Directory -ErrorAction SilentlyContinue | Out-Null
                   $MediaPageFolder = "$MediaBaseFolder\$VolledigAdres"; New-Item $MediaPageFolder -ItemType Directory -ErrorAction SilentlyContinue | Out-Null
                   $Media = @()
                   $FirstString = '"contentUrl":"'
                   $SecondString = '"}'
                   $Pattern = "$FirstString(.*?)$SecondString"
                   $ImageLinks = ( $Content | Select-String -AllMatches $Pattern ).Matches.Value
-                    ForEach ( $ImageLink in $ImageLinks ) {
-                      $ImageLink = ( $ImageLink ).Replace( '"contentUrl":"' , '' ).Replace( '"}' , '' )
+                    $Media += $ImageLinks | % -Par {
+                      $ImageLink = ( $_ ).Replace( '"contentUrl":"' , '' ).Replace( '"}' , '' )
                       $FileName = Split-Path $ImageLink -Leaf
                       $Object = New-Object PSCustomObject
                       $Object | Add-Member 'Name' $FileName
                       $Object | Add-Member 'Link' $ImageLink
-                      $Media += $Object
-                    }
-                  $MediaFiles = ( RequestPage $Page ).Links.href | Where {$PSItem -Match 'cloud.funda.nl'} | Select -Unique
-                    ForEach ( $MediaFileLink in $MediaFiles ) {
-                      $FileName = Split-Path $MediaFileLink -Leaf
+                      Return $Object
+                    } -AsJob | Wait-Job
+                  $MediaFiles = ( RequestPage $_ ).Links.href | Where {$PSItem -Match 'cloud.funda.nl'} | Select -Unique
+                    $Media += $MediaFiles | % -Par {
+                      $FileName = Split-Path $_ -Leaf
                       $Object = New-Object PSCustomObject
                       $Object | Add-Member 'Name' $FileName
-                      $Object | Add-Member 'Link' $MediaFileLink
-                      $Media += $Object
-                    }
+                      $Object | Add-Member 'Link' $_
+                      Return $Object
+                    } -AsJob | Wait-Job
                     If ( $Media ) {
-                      $Media | ForEach -Parallel {
+                      $Media | ForEach -ThrottleLimit $Using:ThrottleLimit -Parallel {
                         $MediaName = $PSItem.Name
                         $MediaLink = $PSItem.Link
                         $MediaFullName = $Using:MediaPageFolder+'\'+$MediaName
-                        Write-Host "Scraping media : download media file $MediaName"
                         Invoke-WebRequest $MediaLink -UseBasicParsing -OutFile $MediaFullName -ErrorAction SilentlyContinue
-                      } -AsJob | Out-Null
-                    } Else {
-                      Write-Host "Scraping media : no media found"
+                      } -AsJob
                     }
                 }
             } Else {
-              $AlreadyScraped = Import-Excel $ExportResults -WorksheetName "$ScriptBaseName" | Where { $PSItem.Page -Eq $Page } | Select VolledigAdres,Makelaar
+              $AlreadyScraped = Import-Excel $Using:ExportResults -WorksheetName "$Using:ScriptBaseName" | Where { $PSItem.Page -Eq $_ } | Select VolledigAdres,Makelaar
               $AlreadyScrapedAddress = $AlreadyScraped.VolledigAdres
               $AlreadyScrapedBroker = $AlreadyScraped.Makelaar
-              Write-Host "$ItemCounter / $TotalLinkCount - Already scraped : $AlreadyScrapedBroker - $AlreadyScrapedAddress"
+              Write-Host "Already scraped : $AlreadyScrapedBroker - $AlreadyScrapedAddress"
             }
-          $DateTimeScraped = ""; $Omschrijving = ""; $SoortParkeerGelegenheid = ""; $GarageVoorzieningen = ""; $GarageCapaciteit = ""; $SoortGarage = ""
-          $SchuurBergingVoorzieningen = ""; $SchuurBerging = ""; $LiggingTuin = ""; $Tuin = ""; $Achtertuin = ""; $Ligging = ""; $EigendomsSituatie = ""
-          $Oppervlakte = ""; $KadastraleGegevensLink = ""; $KadastraleGegevens = ""; $WarmWater = ""; $Verwarming = ""; $Isolatie = ""; $EnergieLabel = ""
-          $AantalWoonlagen = ""; $BadkamerVoorzieningen = ""; $AantalBadkamers = ""; $SoortDak = ""; $Toegankelijkheid = ""; $SoortBouw = ""; $Item = ""
-          $SoortWoning = ""; $Aanvaarding = ""; $MakelaarWebsite = ""; $MakelaarId = ""; $GoogleMaps = ""; $Beschrijving = ""; $Latitude = ""
-          $Longitude = ""; $Internationaal = ""; $Inhoud = ""; $Perceel = ""; $Woonoppervlakte = ""; $ExterneBergruimte = ""; $Bouwjaar = ""; $AchtertuinM = ""
-          $GebouwgebondenBuitenruimte = ""; $Status = ""; $VraagprijsperM = ""; $Koopvorm = ""; $LaatsteVraagprijs = ""; $Vraagprijs = ""
-          $AangebodenSinds = ""; $Makelaar = ""; $BuurtIdentifier = ""; $Land = ""; $Provincie = ""; $Plaats = ""; $Postcode = ""; $StraatHuisnummer = ""
-            If ( $ItemCounter -Eq $ResultCount ) {
-              Break
-            }
-        }
-      If ( $ItemCounter -Eq $ResultCount ) {
-        Break
       }
-    }
+
   }
 
   End {
+    If ( $Result ) { $Result | Export-Excel $ExportResults -WorksheetName "$ScriptBaseName" -Append }
     $ExcelPackage = Export-Excel $ExportResults -WorkSheetName "$ScriptBaseName" -TableStyle 'Medium2' -AutoSize -FreezePane 2,4 -BoldTopRow -PassThru
-    $PivotNameVraagprijsPerM = "Vraagprijs per M2"
-    Add-PivotTable -ExcelPackage $ExcelPackage -PivotRows Makelaar,VolledigAdres -PivotData @{ "VraagprijsperM2" = "Average" } -SourceWorksheet "$ScriptBaseName" -PivotTableName $PivotNameVraagprijsPerM
     @(4,5,7).ForEach{ Set-ExcelColumn -WorkSheet $ExcelPackage."$ScriptBaseName" -Column $PSItem -NumberFormat "[$€-nl-NL] #,##0" -HorizontalAlignment Left -VerticalAlignment Top }
     Set-ExcelRow -Worksheet $ExcelPackage."$ScriptBaseName" -Row 1 -TextRotation 60 -Height 75 -HorizontalAlignment Left -VerticalAlignment Top -WrapText
     Set-ExcelRow -WorkSheet $ExcelPackage."$ScriptBaseName" -Row 2 -Height 15
@@ -497,6 +487,12 @@
     Set-ExcelRange -Wo $ExcelPackage."$ScriptBaseName" -Range BE:BE -Width 135
     Close-ExcelPackage $ExcelPackage
     $ExcelPackage.Dispose()
-    Write-Host "`r`nScraped $ItemCounter site(s) from Funda`r`n"
     $Host.UI.RawUI.WindowTitle = $OriginalWindowTitle
+      Try {
+        Export-Excel $ExportResults -WorksheetName "$ScriptBaseName" -Show -ErrorAction Stop
+      } Catch {
+        Write "Export location:`r`n$ExportResults"
+        Sleep 60
+      }
+
   }
